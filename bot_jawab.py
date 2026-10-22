@@ -3,263 +3,651 @@ import os
 import re
 import base64
 import io
+import time
+import ctypes
+import hashlib
+import threading
+import queue
+import tkinter as tk
+from tkinter import ttk
+
 import mss
-from PIL import Image
+import numpy as np
+from PIL import Image, ImageDraw
 import pyautogui
-from groq import Groq
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 import keyboard
-import time
-import threading
+from deteksi import deteksi, gambar_overlay, ringkas
 
 # =============================================
-# GROQ API KEY - dibaca dari file .env
+# KONFIGURASI (dari file .env)
 # =============================================
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise SystemExit("[!] GROQ_API_KEY belum diisi. Buat file .env (lihat .env.example).")
-client = Groq(api_key=GROQ_API_KEY)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise SystemExit("[!] Isi GOOGLE_API_KEY di file .env. Jangan tempelkan kunci API di kode.")
 
-# Ukuran layar otomatis
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+DEBUG_KLIK = os.getenv("DEBUG_KLIK", "1") == "1"        # simpan debug_klik.png & debug_ai.jpg
+MIN_JAWAB = int(os.getenv("MIN_JAWAB", "1"))            # minimal klik jawaban per halaman sebelum Next
+VIDEO_WAIT = float(os.getenv("VIDEO_WAIT", "6"))        # detik menunggu video setelah di-play
+AUDIO_WAIT = float(os.getenv("AUDIO_WAIT", "2.5"))      # detik menunggu setelah klik speaker
+AI_TIMEOUT = max(5.0, float(os.getenv("AI_TIMEOUT", "45")))  # batas tunggu respons API
+
+MAX_STEPS_PER_PAGE = 15   # batas langkah per halaman sebelum paksa Next
+STUCK_LIMIT = 3           # layar sama sekian kali setelah beraksi -> paksa Next
+NO_SOAL_LIMIT = 4         # AI bilang "tidak ada soal" sekian kali -> coba Next
+
+google_client = genai.Client(
+    api_key=GOOGLE_API_KEY,
+    http_options=types.HttpOptions(timeout=int(AI_TIMEOUT * 1000)),
+)
+
+# Supaya koordinat benar di Windows dengan display scaling
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
+pyautogui.FAILSAFE = True   # mouse ke pojok kiri atas = stop paksa
+pyautogui.PAUSE = 0.05
+
 screen_w, screen_h = pyautogui.size()
-
-# Posisi tombol Next (bottom-right, selalu sama)
-NEXT_X = 0.972
-NEXT_Y = 0.972
-
 is_running = False
+status_events = queue.Queue()
+status_state = {
+    "stage": "Siap",
+    "detail": "Tekan F8 atau tombol Mulai untuk menjalankan bot.",
+    "level": "ready",
+    "started_at": None,
+}
+
+
+def set_status(stage, detail="", level="working"):
+    """Kirim status kerja ke panel UI tanpa mengganggu thread bot."""
+    started_at = time.monotonic() if level == "working" else None
+    status_events.put(("status", stage, detail, level, started_at))
 
 # =============================================
-# FUNGSI SCREENSHOT
+# STATE PER HALAMAN
 # =============================================
-def capture_screen():
-    """Tangkap full layar sebagai base64 JPEG."""
+class Halaman:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.riwayat = []
+        self.langkah = 0
+        self.jawab = 0                 # jumlah klik jawaban yang sudah dilakukan
+        self.butuh = MIN_JAWAB         # minimal jawaban sebelum Next boleh
+        self.diputar = False           # video sudah di-play
+        self.audio_diklik = False      # speaker sudah diklik
+        self.tipe = "UNKNOWN"
+        self.last_hash = None
+        self.sama = 0
+        self.tanpa_soal = 0
+
+# =============================================
+# SCREENSHOT
+# =============================================
+def capture_screen(simpan=False):
+    """Return (base64 JPEG ber-ID, hash layar, elemen terdeteksi)."""
+    set_status("Mengambil screenshot", "Membaca tampilan layar saat ini.")
     with mss.MSS() as sct:
         monitor = {"top": 0, "left": 0, "width": screen_w, "height": screen_h}
         sct_img = sct.grab(monitor)
-        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+        asli = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
 
-    if img.width > 1280:
-        ratio = 1280 / img.width
-        img = img.resize((1280, int(img.height * ratio)), Image.LANCZOS)
+    kecil = asli.resize((64, 36)).convert("L")
+    layar_hash = hashlib.md5(kecil.tobytes()).hexdigest()
+    set_status("Mendeteksi elemen", "Mencari tombol, opsi, gambar, teks, dan kolom kosong.")
+    hasil = deteksi(np.asarray(asli)[:, :, ::-1].copy())
+    elems = hasil["elems"]
+
+    skala = min(1.0, 1280 / asli.width)
+    if skala < 1:
+        img = asli.resize((1280, int(asli.height * skala)), Image.LANCZOS)
+    else:
+        img = asli.copy()
+    img = gambar_overlay(img, elems, skala)
+
+    if simpan and DEBUG_KLIK:
+        img.save("debug_ai.jpg", quality=85)
 
     buffer = io.BytesIO()
     img.save(buffer, format="JPEG", quality=85)
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode("utf-8")
+    set_status("Screenshot siap", f"{len(elems)} elemen diberi ID.", "ready")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8"), layar_hash, elems
+
+
+def hash_screen():
+    """Ambil hash layar tanpa menjalankan deteksi, overlay, atau encoding gambar."""
+    with mss.MSS() as sct:
+        monitor = {"top": 0, "left": 0, "width": screen_w, "height": screen_h}
+        sct_img = sct.grab(monitor)
+    img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+    kecil = img.resize((64, 36)).convert("L")
+    return hashlib.md5(kecil.tobytes()).hexdigest()
 
 # =============================================
-# FUNGSI TANYA AI
+# TANYA AI
 # =============================================
-def tanya_ai(img_base64):
-    prompt = (
-        "Kamu adalah bot otomatis untuk mengerjakan soal quiz bahasa Inggris di browser.\n"
-        "Analisis screenshot ini dan tentukan:\n"
-        "1. Apakah ada soal aktif?\n"
-        "2. Tipe soalnya apa?\n"
-        "3. Urutan aksi apa yang harus dilakukan untuk menjawab dengan benar?\n\n"
+def extract_json(raw):
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    awal = raw.find("{")
+    akhir = raw.rfind("}")
+    if awal == -1 or akhir == -1:
+        raise json.JSONDecodeError("JSON tidak ditemukan", raw, 0)
+    return json.loads(raw[awal:akhir + 1])
 
-        "=== TIPE SOAL YANG MUNGKIN ADA ===\n"
-        "RADIO      : Pilihan ganda dengan radio button (klik radio button yang benar)\n"
-        "PICTURE    : Pilih gambar yang benar dari beberapa gambar\n"
-        "MATCH      : Drag label/kata dari sisi kanan ke kotak di bawah gambar\n"
-        "DROPDOWN   : Klik dropdown dan pilih kata yang benar\n"
-        "WORDBANK   : Klik kata dari word bank di bawah, lalu klik bagian blank di kalimat\n"
-        "AUDIO      : Ada tombol speaker, klik speaker lalu pilih gambar yang sesuai\n"
-        "VIDEO      : Halaman berisi video player (bukan soal). Langsung skip ke Next.\n"
-        "             Kalau ada popup 'Reminder' / 'Continue' / 'Stay in this step' → klik 'Continue' dulu\n\n"
 
-        "=== FORMAT JSON WAJIB (HANYA JSON, TIDAK ADA TEKS LAIN) ===\n"
-        "{\n"
-        '  "ada_soal": true,\n'
-        '  "tipe": "RADIO",\n'
-        '  "keterangan": "penjelasan singkat apa yang dilakukan",\n'
-        '  "actions": [\n'
-        '    {"type": "click", "x": 28, "y": 66, "label": "opsi 1"},\n'
-        '    {"type": "next"}\n'
-        "  ]\n"
-        "}\n\n"
-
-        "=== JENIS ACTION ===\n"
-        '{"type": "click", "x": X, "y": Y, "label": "keterangan"}\n'
-        "  → Klik koordinat. x dan y adalah PERSENTASE layar (0-100)\n\n"
-        '{"type": "drag", "from_x": X, "from_y": Y, "to_x": X2, "to_y": Y2, "label": "keterangan"}\n'
-        "  → Drag dari satu titik ke titik lain (untuk soal MATCH)\n\n"
-        '{"type": "wait", "seconds": 1}\n'
-        "  → Tunggu beberapa detik\n\n"
-        '{"type": "audio"}\n'
-        "  → Klik tombol speaker/audio (otomatis dicari di sekitar atas layar)\n\n"
-        '{"type": "next"}\n'
-        "  → Klik tombol Next/lanjut (selalu di sudut kanan bawah)\n\n"
-
-        "=== ATURAN PENTING ===\n"
-        "- x dan y adalah PERSENTASE (0-100) dari lebar dan tinggi layar\n"
-        "- Selalu akhiri dengan {\"type\": \"next\"}\n"
-        "- Untuk MATCH: drag label dari kanan ke kotak kosong di bawah gambar\n"
-        "- Untuk DROPDOWN: klik dropdown, tunggu, lalu klik opsi yang benar\n"
-        "- Untuk WORDBANK: klik setiap kata di word bank, lalu klik blank-nya di kalimat\n"
-        "- Untuk AUDIO: gunakan action audio, tunggu 3 detik, lalu klik gambar yang benar\n"
-        "- Kalau tidak yakin tipe soalnya, tetap coba jawab semampu mungkin\n"
-        "- Kalau tidak ada soal: {\"ada_soal\": false, \"tipe\": null, \"keterangan\": \"tidak ada soal\", \"actions\": []}\n"
-        "- HANYA kembalikan JSON, tidak ada teks lain apapun!"
+def buat_prompt_jawaban(hal, elems):
+    hist = "; ".join(hal.riwayat[-8:]) if hal.riwayat else "(belum ada)"
+    daftar_elemen = ringkas(elems) or "(belum ada elemen terdeteksi)"
+    return (
+        "Kamu menyelesaikan quiz bahasa Inggris dengan screenshot dan ID elemen yang terdeteksi. "
+        "Analisis soal, tentukan jawaban, lalu pilih SATU aksi berikutnya dari ID aktif. "
+        "Jangan pernah membuat koordinat, box, x/y, atau ID yang tidak tercantum. "
+        "Titik mouse dihitung program lokal dari pusat kotak ID; kamu tidak menggerakkan mouse.\n"
+        "Nomor overlay menunjuk elemen: box=kontrol/chip, img=gambar, teks=baris opsi, "
+        "blank=kolom kosong, next=tombol Next.\n"
+        f"Tipe sebelumnya={hal.tipe}; jawaban sudah dilakukan={hal.jawab}; "
+        f"minimal sebelum Next={hal.butuh}; langkah={hal.langkah}; riwayat={hist}.\n"
+        f"Daftar ID aktif: {daftar_elemen}\n\n"
+        "Aturan:\n"
+        "- Jawaban pilihan: klik ID teks/gambar yang sesuai dengan jawaban.\n"
+        "- Dropdown tertutup: klik kontrol saja; setelah screenshot baru pilih teks opsi.\n"
+        "- Word bank: drag dari ID kata ke ID blank.\n"
+        "- Isian teks: ketik jawaban pada ID kolom.\n"
+        "- Audio: klik ID speaker sekali sebagai answer:false, lalu evaluasi ulang setelah screenshot baru.\n"
+        "- Video: klik ID play jika belum berjalan; jika sudah berjalan gunakan ID next.\n"
+        "- Popup: klik Continue/OK sebagai answer:false.\n"
+        "- Lakukan MAKSIMAL SATU aksi yang mengubah layar. ID hanya berlaku untuk screenshot ini.\n"
+        "- Untuk Next, gunakan ID bertipe next yang terlihat. Jangan Next jika belum mencapai minimal jawaban.\n"
+        "- Jika loading atau tidak ada soal: ada_soal=false dan actions=[]; jangan menebak klik.\n"
+        "Kembalikan JSON saja, dengan bentuk:\n"
+        '{"ada_soal":true,"tipe":"RADIO|PICTURE|WORDBANK|DROPDOWN|TEXT|AUDIO|VIDEO|POPUP|UNKNOWN",'
+        '"soal":"teks pertanyaan singkat","jawaban":"jawaban final atau null",'
+        '"keterangan":"singkat","actions":[{"type":"click","id":4,'
+        '"label":"opsi jawaban","answer":true}]}'
     )
 
-    response = client.chat.completions.create(
-        model="qwen/qwen3.8-27b",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
-                    },
-                    {"type": "text", "text": prompt}
-                ]
-            }
-        ],
-        temperature=0.1,
-        max_tokens=600,
-        response_format={"type": "json_object"}
+
+def jawab_soal_google(img_base64, hal, elems):
+    """Gemini memahami screenshot, menjawab soal, dan memilih satu aksi berbasis ID."""
+    set_status(
+        "Menganalisis soal dengan Gemini",
+        f"Model {GEMINI_MODEL}; batas tunggu {AI_TIMEOUT:g} detik.",
     )
-
-    raw = response.choices[0].message.content.strip()
-    print(f"[i] Respon AI: {raw}")
-    return json.loads(raw)
+    mulai = time.monotonic()
+    gambar = Image.open(io.BytesIO(base64.b64decode(img_base64)))
+    response = google_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[gambar, buat_prompt_jawaban(hal, elems)],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+            max_output_tokens=600,
+        ),
+    )
+    raw = response.text
+    if not raw:
+        raise ValueError("Gemini mengembalikan respons kosong.")
+    data = extract_json(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Respons Gemini harus berupa objek JSON.")
+    data.setdefault("ada_soal", False)
+    data.setdefault("tipe", "UNKNOWN")
+    data.setdefault("jawaban", None)
+    data.setdefault("soal", "")
+    data.setdefault("keterangan", "")
+    data.setdefault("actions", [])
+    set_status(
+        "Gemini selesai menjawab dan memilih aksi",
+        f"{time.monotonic() - mulai:.1f} detik; tipe={data['tipe']}; jawaban={data['jawaban']}",
+        "ready",
+    )
+    print(f"[i] Jawaban dan aksi Gemini: {data}")
+    return data
 
 # =============================================
-# FUNGSI AKSI
+# AKSI MOUSE / KEYBOARD
 # =============================================
-def klik(x_ratio, y_ratio, label=""):
-    x = int(x_ratio * screen_w)
-    y = int(y_ratio * screen_h)
-    pyautogui.moveTo(x, y, duration=0.25)
-    pyautogui.click(x, y)
+def cari_elemen(id_elemen, elems, jenis=None):
+    """Resolve ID dari screenshot aktif; ID tak valid tidak pernah menjadi koordinat."""
+    if isinstance(id_elemen, bool) or not isinstance(id_elemen, int):
+        raise ValueError(f"ID elemen harus bilangan bulat, diterima: {id_elemen!r}")
+    for elem in elems:
+        if elem["id"] == id_elemen and (jenis is None or elem["kind"] == jenis):
+            return elem
+    jenis_info = f" bertipe {jenis}" if jenis else ""
+    raise ValueError(f"ID elemen {id_elemen}{jenis_info} tidak ada pada screenshot saat ini.")
+
+
+def simpan_debug(x, y):
+    if not DEBUG_KLIK:
+        return
+    try:
+        with mss.MSS() as sct:
+            s = sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h})
+            img = Image.frombytes("RGB", s.size, s.bgra, "raw", "BGRX")
+        d = ImageDraw.Draw(img)
+        d.ellipse([x - 18, y - 18, x + 18, y + 18], outline=(255, 0, 0), width=4)
+        d.line([(x - 30, y), (x + 30, y)], fill=(255, 0, 0), width=2)
+        d.line([(x, y - 30), (x, y + 30)], fill=(255, 0, 0), width=2)
+        img.save("debug_klik.png")
+    except Exception:
+        pass
+
+
+def klik(x, y, label="", dobel=False):
+    simpan_debug(x, y)
+    pyautogui.moveTo(x, y, duration=0.12)
+    if dobel:
+        pyautogui.doubleClick(x, y)
+    else:
+        pyautogui.click(x, y)
     print(f"  [✓] Click {label} → ({x}, {y})")
 
-def drag(from_x_r, from_y_r, to_x_r, to_y_r, label=""):
-    fx = int(from_x_r * screen_w)
-    fy = int(from_y_r * screen_h)
-    tx = int(to_x_r  * screen_w)
-    ty = int(to_y_r  * screen_h)
+
+def drag(fx, fy, tx, ty, label=""):
+    """Drag antartitik tengah elemen pada resolusi layar asli."""
     pyautogui.moveTo(fx, fy, duration=0.3)
+    time.sleep(0.15)
+    pyautogui.mouseDown(button="left")
+    time.sleep(0.15)
+    pyautogui.moveRel(8, 8, duration=0.1)   # picu event drag-start
+    steps = 12
+    for i in range(1, steps + 1):
+        pyautogui.moveTo(fx + (tx - fx) * i / steps, fy + (ty - fy) * i / steps, duration=0.04)
     time.sleep(0.2)
-    pyautogui.dragTo(tx, ty, duration=0.6, button='left')
+    pyautogui.moveTo(tx, ty, duration=0.1)
+    time.sleep(0.15)
+    pyautogui.mouseUp(button="left")
     print(f"  [✓] Drag {label}: ({fx},{fy}) → ({tx},{ty})")
 
-def klik_next():
-    klik(NEXT_X, NEXT_Y, label="Next >")
 
-def klik_audio():
-    # Speaker biasanya ada di sekitar tengah-atas konten
-    klik(0.27, 0.19, label="Audio/Speaker button")
+ABAIKAN = re.compile(r"\b(continue|reminder|speaker|audio|play|popup|close|tutup|ok|stay)\b", re.I)
 
-def jalankan_actions(actions):
-    """Eksekusi daftar actions dari AI."""
+
+def hitung_jawaban(action):
+    """Apakah aksi ini dihitung sebagai 'menjawab'?"""
+    if action.get("answer") is False:
+        return False
+    if ABAIKAN.search(str(action.get("label", ""))):
+        return False
+    return True
+
+
+def jalankan_actions(actions, hal, elems):
+    """Eksekusi actions. Return True kalau Next diminta DAN diizinkan."""
     for i, action in enumerate(actions):
         atype = action.get("type", "")
-        label = action.get("label", f"action {i+1}")
-        print(f"  [~] Aksi {i+1}/{len(actions)}: {atype} — {label}")
+        label = action.get("label", "")
+        print(f"  [~] Aksi {i+1}/{len(actions)}: {atype} {label}")
+        set_status("Menjalankan aksi", f"{atype}: {label or 'tanpa label'}")
 
-        if atype == "click":
-            x = action.get("x", 50)
-            y = action.get("y", 50)
-            klik(x / 100, y / 100, label=label)
-            time.sleep(action.get("delay_after", 0.6))
+        if atype in ("click", "double_click"):
+            elem = cari_elemen(action.get("id"), elems)
+            klik(elem["cx"], elem["cy"], label=label, dobel=(atype == "double_click"))
+            if hitung_jawaban(action):
+                hal.jawab += 1
+            hal.riwayat.append(f"{atype} {label}".strip())
+            time.sleep(action.get("delay_after", 0.2))
+            return False
 
         elif atype == "drag":
-            fx = action.get("from_x", 50)
-            fy = action.get("from_y", 50)
-            tx = action.get("to_x", 50)
-            ty = action.get("to_y", 50)
-            drag(fx/100, fy/100, tx/100, ty/100, label=label)
+            asal = cari_elemen(action.get("from_id"), elems)
+            tujuan = cari_elemen(action.get("to_id"), elems)
+            drag(asal["cx"], asal["cy"], tujuan["cx"], tujuan["cy"], label=label)
+            if hitung_jawaban(action):
+                hal.jawab += 1
+            hal.riwayat.append(f"drag {label}".strip())
             time.sleep(action.get("delay_after", 0.8))
+            return False
+
+        elif atype == "type":
+            elem = cari_elemen(action.get("id"), elems)
+            klik(elem["cx"], elem["cy"], label="kolom teks")
+            time.sleep(0.3)
+            teks = str(action.get("text", ""))
+            keyboard.write(teks, delay=0.03)
+            print(f"  [✓] Ketik: {teks}")
+            hal.jawab += 1
+            hal.riwayat.append(f"ketik '{teks}'")
+            time.sleep(0.5)
+            return False
+
+        elif atype == "key":
+            tombol = str(action.get("key", "enter"))
+            pyautogui.press(tombol)
+            print(f"  [✓] Tekan tombol: {tombol}")
+            hal.riwayat.append(f"tekan {tombol}")
+            time.sleep(0.5)
+            return False
+
+        elif atype == "scroll":
+            amount = int(action.get("amount", -5))
+            pyautogui.scroll(amount * 100)
+            hal.riwayat.append("scroll")
+            time.sleep(0.5)
+            return False
 
         elif atype == "wait":
-            secs = action.get("seconds", 1)
-            print(f"  [~] Tunggu {secs} detik...")
-            time.sleep(secs)
+            seconds = float(action.get("seconds", 1))
+            set_status("Menunggu", f"Jeda {seconds:g} detik sesuai instruksi.")
+            time.sleep(seconds)
 
         elif atype == "audio":
-            klik_audio()
-            print("  [~] Tunggu audio selesai (3 detik)...")
-            time.sleep(3)
+            if hal.audio_diklik:
+                print("  [~] Speaker sudah diklik di halaman ini, skip. Langsung pilih jawaban.")
+                continue
+            elem = cari_elemen(action.get("id"), elems)
+            klik(elem["cx"], elem["cy"], label="Audio/Speaker")
+            hal.audio_diklik = True
+            hal.riwayat.append("klik speaker (SUDAH, jangan klik lagi; langsung pilih jawaban tebakan)")
+            set_status("Memutar audio", f"Menunggu audio {AUDIO_WAIT:g} detik.")
+            time.sleep(AUDIO_WAIT)
+            return False
+
+        elif atype == "play":
+            elem = cari_elemen(action.get("id"), elems)
+            klik(elem["cx"], elem["cy"], label="Play video")
+            hal.diputar = True
+            hal.riwayat.append("play video")
+            print(f"  [~] Tunggu video {VIDEO_WAIT} detik...")
+            set_status("Menunggu video", f"Video berjalan; jeda {VIDEO_WAIT:g} detik.")
+            time.sleep(VIDEO_WAIT)
+            return False
+
+        elif atype == "replan":
+            time.sleep(0.7)
+            return False
 
         elif atype == "next":
-            klik_next()
-            print("  [~] Tunggu halaman berikutnya (2.5 detik)...")
-            time.sleep(2.5)
+            cari_elemen(action.get("id"), elems, jenis="next")
+            if hal.tipe == "VIDEO":
+                if not hal.diputar:
+                    print(f"  [~] Video belum diputar, tunggu {VIDEO_WAIT} detik dulu...")
+                    set_status("Menunggu video", f"Menunggu {VIDEO_WAIT:g} detik sebelum lanjut.")
+                    time.sleep(VIDEO_WAIT)
+                    hal.diputar = True
+                return True
+            if hal.jawab < hal.butuh:
+                print(f"  [!] Next DITAHAN: baru {hal.jawab} jawaban, butuh minimal {hal.butuh}.")
+                set_status("Next ditahan", f"Jawaban {hal.jawab}/{hal.butuh}; pilih jawaban lagi.", "warning")
+                hal.riwayat.append(f"NEXT DITOLAK: baru {hal.jawab} jawaban, harus klik jawaban dulu (tebak saja)")
+                return False
+            return True
 
         else:
             print(f"  [!] Tipe action tidak dikenal: {atype}, skip...")
+
+    return False
+
+
+def pindah_halaman(hal, elems, sebelum):
+    """Klik elemen Next yang terdeteksi lalu cek apakah halaman benar-benar berpindah."""
+    tombol = next((elem for elem in elems if elem["kind"] == "next"), None)
+    if tombol is None:
+        print("[!] Tombol Next tidak terdeteksi; tidak ada koordinat tebakan yang digunakan.")
+        hal.riwayat.append("Next tidak dijalankan: elemen next tidak terdeteksi")
+        set_status("Next tidak terdeteksi", "Pastikan tombol Next terlihat di layar.", "warning")
+        return False
+    klik(tombol["cx"], tombol["cy"], label=f'Next (ID {tombol["id"]})')
+    print("  [~] Tunggu halaman berikutnya...")
+    set_status("Menunggu halaman", "Memeriksa apakah tombol Next memindahkan halaman.")
+    time.sleep(3)
+    set_status("Memeriksa perubahan layar", "Membandingkan tampilan sebelum dan sesudah Next.")
+    sesudah = hash_screen()
+
+    if sesudah == sebelum:
+        hal.butuh = min(hal.butuh + 1, 6)
+        hal.riwayat.append(
+            "NEXT ditekan tapi halaman tidak berpindah (masih ada yang harus dijawab / semua kartu harus dibalik)"
+        )
+        hal.last_hash = None
+        hal.sama = 0
+        print(f"  [!] Halaman tidak berpindah. Minimal jawaban dinaikkan jadi {hal.butuh}.")
+        return False
+
+    hal.reset()
+    return True
 
 # =============================================
 # LOOP UTAMA BOT
 # =============================================
 def proses_bot():
     global is_running
-    print(f"\n[+] BOT MULAI | Layar: {screen_w}x{screen_h}")
-    print("[i] F8 = pause/stop\n")
+    print(
+        f"\n[+] BOT MULAI | Layar: {screen_w}x{screen_h} | "
+        f"Gemini Vision: {GEMINI_MODEL}"
+    )
+    print(f"[i] MIN_JAWAB={MIN_JAWAB} VIDEO_WAIT={VIDEO_WAIT}s | F8 pause | F9 keluar | mouse ke pojok kiri-atas = stop paksa\n")
+    set_status("Bot berjalan", f"Gemini menjawab dan memilih ID: {GEMINI_MODEL}.")
+
+    hal = Halaman()
 
     while is_running:
         try:
-            # 1. Screenshot
             print("[~] Screenshot layar...")
-            img_b64 = capture_screen()
+            img_b64, layar_hash, elems = capture_screen(simpan=True)
 
-            # 2. Tanya AI
-            print("[~] Analisis AI (qwen vision)...")
-            data = tanya_ai(img_b64)
-
-            tipe      = data.get("tipe", "UNKNOWN")
-            keterangan = data.get("keterangan", "")
-            actions   = data.get("actions", [])
-
-            # 3. Tidak ada soal (tapi VIDEO tetap diproses)
-            if not data.get("ada_soal") and tipe != "VIDEO":
-                print("[!] Tidak ada soal terdeteksi. Tunggu 2 detik...")
-                time.sleep(2)
+            hal.sama = hal.sama + 1 if layar_hash == hal.last_hash else 0
+            hal.last_hash = layar_hash
+            if hal.riwayat and hal.sama >= STUCK_LIMIT:
+                print("[!] Layar tidak berubah, paksa Next...")
+                set_status("Layar tidak berubah", "Mencoba Next setelah beberapa langkah tanpa perubahan.", "warning")
+                pindah_halaman(hal, elems, layar_hash)
+                hal.sama = 0
                 continue
 
-            print(f"\n[✓] Halaman terdeteksi!")
-            print(f"    Tipe      : {tipe}")
-            print(f"    Keterangan: {keterangan}")
-            print(f"    Actions   : {len(actions)} langkah\n")
+            hal.langkah += 1
+            if hal.langkah > MAX_STEPS_PER_PAGE:
+                print("[!] Terlalu banyak langkah di halaman ini, paksa Next...")
+                set_status("Batas langkah tercapai", "Mencoba Next agar bot tidak macet.", "warning")
+                pindah_halaman(hal, elems, layar_hash)
+                hal.langkah = 0
+                continue
 
-            # 4. Jalankan semua actions
+            print(f"[~] Gemini menganalisis gambar soal (langkah {hal.langkah})...")
+            data = jawab_soal_google(img_b64, hal, elems)
+
+            tipe = str(data.get("tipe") or "UNKNOWN").upper()
+
+            if not data.get("ada_soal") and tipe not in ("VIDEO", "POPUP"):
+                hal.langkah -= 1
+                hal.tanpa_soal += 1
+                if hal.tanpa_soal >= NO_SOAL_LIMIT:
+                    print("[!] Lama tidak ada soal terdeteksi, coba Next...")
+                    pindah_halaman(hal, elems, layar_hash)
+                    hal.tanpa_soal = 0
+                else:
+                    print("[!] Tidak ada soal terdeteksi. Tunggu 2 detik...")
+                    set_status("Menunggu soal", f"Belum ada soal; percobaan {hal.tanpa_soal}/{NO_SOAL_LIMIT}.")
+                    time.sleep(2)
+                continue
+            hal.tanpa_soal = 0
+
+            if tipe != "UNKNOWN":
+                hal.tipe = tipe
+
+            actions = data.get("actions", []) or []
+            print(f"\n[✓] Tipe: {hal.tipe} | {data.get('keterangan', '')} | {len(actions)} aksi | "
+                  f"jawab {hal.jawab}/{hal.butuh}\n")
+
             if actions:
-                jalankan_actions(actions)
+                minta_next = jalankan_actions(actions, hal, elems)
             else:
-                # Fallback kalau AI tidak kasih actions
-                print("[!] AI tidak kasih actions, langsung klik Next...")
-                klik_next()
-                time.sleep(2.5)
+                # AI tidak memberi aksi: Next hanya kalau syarat terpenuhi
+                minta_next = (hal.tipe == "VIDEO") or (hal.jawab >= hal.butuh)
+                if not minta_next:
+                    hal.riwayat.append("tidak ada aksi; klik jawaban (tebak) dulu")
+                    time.sleep(1)
+
+            if minta_next:
+                pindah_halaman(hal, elems, layar_hash)
+
+        except pyautogui.FailSafeException:
+            print("\n[-] FAILSAFE: mouse di pojok layar. Bot dihentikan.")
+            is_running = False
+            set_status("Dihentikan oleh failsafe", "Mouse mencapai sudut kiri atas.", "error")
 
         except json.JSONDecodeError as e:
             print(f"[!] JSON error dari AI: {e}")
+            set_status("Error respons AI", f"Format JSON tidak valid: {e}", "error")
             time.sleep(3)
 
+        except ValueError as e:
+            print(f"[!] Aksi AI ditolak: {e}")
+            hal.riwayat.append(f"AKSI DITOLAK: {e}; gunakan ID dari screenshot terbaru")
+            set_status("Aksi ditolak", str(e), "warning")
+            time.sleep(1)
+
         except Exception as e:
-            print(f"[!] Error: {e}")
-            time.sleep(3)
+            msg = str(e)
+            print(f"[!] Error: {msg}")
+            jeda = 10 if ("429" in msg or "rate" in msg.lower()) else 3
+            set_status("Error — bot akan mencoba lagi", f"{msg}\nCoba lagi dalam {jeda} detik.", "error")
+            time.sleep(jeda)
+
+    print("[-] Loop bot berhenti.")
+
 
 def toggle_bot():
     global is_running
     if not is_running:
         is_running = True
+        set_status("Bot berjalan", "Memulai proses; screenshot berikutnya segera diambil.")
         threading.Thread(target=proses_bot, daemon=True).start()
     else:
         is_running = False
         print("\n[-] BOT PAUSE.")
+        set_status("Dijeda", "Tekan F8 atau tombol Lanjutkan untuk meneruskan.", "ready")
+
+
+def keluar():
+    global is_running
+    is_running = False
+    status_events.put(("exit",))
+
+
+def jalankan_panel():
+    root = tk.Tk()
+    root.title("Cyells Bot - Status")
+    root.geometry("500x235")
+    root.resizable(False, False)
+    root.configure(padx=18, pady=14)
+
+    ttk.Label(root, text="CYELLS BOT", font=("Segoe UI", 15, "bold")).pack(anchor="w")
+    status_label = ttk.Label(root, font=("Segoe UI", 12, "bold"))
+    status_label.pack(anchor="w", pady=(10, 2))
+    detail_label = ttk.Label(root, wraplength=460, justify="left")
+    detail_label.pack(anchor="w", fill="x", pady=(0, 4))
+    elapsed_label = ttk.Label(root, text="Siap", foreground="#555555")
+    elapsed_label.pack(anchor="w")
+
+    progress = ttk.Progressbar(root, mode="indeterminate", length=460)
+    progress.pack(fill="x", pady=(10, 10))
+
+    tombol = ttk.Frame(root)
+    tombol.pack(fill="x")
+    tombol_jalan = ttk.Button(tombol, text="Mulai", command=toggle_bot)
+    tombol_jalan.pack(side="left")
+    ttk.Button(tombol, text="Keluar (F9)", command=keluar).pack(side="right")
+    progress_running = [False]
+
+    warna = {
+        "working": "#1769aa",
+        "ready": "#287a3d",
+        "warning": "#a05a00",
+        "error": "#b42318",
+    }
+    tahap_memuat = {
+        "Mengambil screenshot",
+        "Mendeteksi elemen",
+        "Menganalisis soal dengan Gemini",
+        "Menunggu analisis AI",
+        "Mencoba format AI alternatif",
+        "Menjalankan aksi",
+        "Memutar audio",
+        "Menunggu video",
+        "Menunggu halaman",
+        "Memeriksa perubahan layar",
+        "Menunggu",
+    }
+
+    def perbarui_panel():
+        while True:
+            try:
+                event = status_events.get_nowait()
+            except queue.Empty:
+                break
+            if event[0] == "exit":
+                root.destroy()
+                return
+            _, stage, detail, level, started_at = event
+            status_state.update(
+                stage=stage,
+                detail=detail,
+                level=level,
+                started_at=started_at,
+            )
+
+        stage = status_state["stage"]
+        detail = status_state["detail"]
+        level = status_state["level"]
+        started_at = status_state["started_at"]
+        status_label.configure(text=f"[{level.upper()}] {stage}", foreground=warna.get(level, "#555555"))
+        detail_label.configure(text=detail)
+        tombol_jalan.configure(text="Jeda (F8)" if is_running else "Mulai (F8)")
+
+        if started_at is not None:
+            durasi = time.monotonic() - started_at
+            teks_durasi = f"Berjalan {durasi:.0f} detik"
+            if stage == "Menunggu analisis AI" and durasi >= 30:
+                teks_durasi += " — masih menunggu model/API; periksa koneksi jika terlalu lama"
+            elapsed_label.configure(text=teks_durasi)
+        else:
+            elapsed_label.configure(text="Bot aktif" if is_running else "Siap")
+
+        if level == "working" and stage in tahap_memuat:
+            if str(progress["mode"]) != "indeterminate":
+                progress.configure(mode="indeterminate")
+            if not progress_running[0]:
+                progress.start(12)
+                progress_running[0] = True
+        else:
+            if progress_running[0]:
+                progress.stop()
+                progress_running[0] = False
+            progress.configure(mode="determinate", maximum=1, value=1 if level == "ready" else 0)
+
+        root.after(150, perbarui_panel)
+
+    def tutup_panel():
+        global is_running
+        is_running = False
+        keyboard.unhook_all()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", tutup_panel)
+    keyboard.add_hotkey("f8", toggle_bot)
+    keyboard.add_hotkey("f9", keluar)
+    perbarui_panel()
+    root.mainloop()
+    keyboard.unhook_all()
+
 
 print("=" * 52)
 print("  CYELLS BOT - Multi-Type Quiz (ed.engdis.com)")
 print("=" * 52)
 print("  F8        -> MULAI / PAUSE")
-print("  Ctrl+C    -> Keluar")
+print("  F9        -> KELUAR")
 print("=" * 52)
 print()
 
-keyboard.add_hotkey('f8', toggle_bot)
-keyboard.wait()
+jalankan_panel()

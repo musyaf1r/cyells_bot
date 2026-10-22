@@ -1,0 +1,8 @@
+keyboard
+mss
+numpy
+opencv-python-headless
+Pillow
+pyautogui
+python-dotenv
+google-genai
